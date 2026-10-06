@@ -56,7 +56,15 @@ class PurchaseWithholdingSriEc(Document):
 		#journal_entry.bill_date = "Accounts Receivable"
 		#journal_entry.due_date = "Accounts Receivable"
 
-		account_for_withHolding = '2110 - Acreedores - RSCV'
+		account_for_withHolding = frappe.get_cached_value(
+			"Company", self.company, "default_payable_account"
+		)
+		if not account_for_withHolding:
+			frappe.throw(
+				frappe._("Please set Default Payable Account for Company {0}").format(
+					self.company
+				)
+			)
 
 		total_credit_in_account_currency = 0
 		#Linea de cuenta de Acreedores
