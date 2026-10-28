@@ -79,13 +79,24 @@ class PurchaseWithholdingSriEc(Document):
 			credits.setdefault(si.name, {"si": si, "amount": 0})["amount"] += itemTax.valorRetenido
 		journal_entry.pay_to_recd_from = next(iter(credits.values()))["si"].customer
 		for itemTax in self.taxes:
-			journal_entry.append('accounts', {
+			line = {
 				'account': itemTax.codigoRetencion,
 				'debit': itemTax.valorRetenido,
 				'debit_in_account_currency': itemTax.valorRetenido,
 				'credit': 0,
 				'credit_in_account_currency': 0,
-			})
+			}
+			# Payable/Receivable accounts require a party whose Party Type matches the account type
+			# (a Customer is rejected on a Payable RET account), so keep the Supplier of the purchase flow.
+			account_type = frappe.get_cached_value("Account", itemTax.codigoRetencion, "account_type")
+			if account_type == "Payable":
+				customer = self.find_sales_invoice(itemTax.numDocSustento).customer
+				line['party_type'] = 'Supplier'
+				line['party'] = customer if frappe.db.exists("Supplier", customer) else self.purchase_withholding_supplier
+			elif account_type == "Receivable":
+				line['party_type'] = 'Customer'
+				line['party'] = self.find_sales_invoice(itemTax.numDocSustento).customer
+			journal_entry.append('accounts', line)
 		for row in credits.values():
 			journal_entry.append('accounts', {
 				'account': row["si"].debit_to,
