@@ -3,6 +3,8 @@
 
 from __future__ import unicode_literals
 
+import datetime
+
 import frappe
 from frappe.model.document import Document
 from erpnext.accounts.doctype.journal_entry.journal_entry import get_payment_entry
@@ -40,13 +42,70 @@ class PurchaseWithholdingSriEc(Document):
 		
 		pass
 	
+	def get_posting_date(self):
+		value = self.fechaEmision
+		if isinstance(value, str) and "/" in value:
+			return datetime.datetime.strptime(value.strip()[:10], "%d/%m/%Y").date()
+		return frappe.utils.getdate(value)
+
+	def is_sales_withholding(self):
+		# The withheld subject is our own Company: the customer withheld us on a sale.
+		tax_id = frappe.get_cached_value("Company", self.company, "tax_id")
+		return bool(tax_id) and (self.identificacionSujetoRetenido or "").strip() == tax_id.strip()
+
+	def find_sales_invoice(self, num_doc):
+		digits = "".join(ch for ch in (num_doc or "") if ch.isdigit())
+		if len(digits) != 15:
+			frappe.throw(frappe._("Invalid numDocSustento {0}").format(num_doc))
+		dashed = f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+		base = {"docstatus": 1, "company": self.company}
+		for filters in (
+			{"docidsri": ["in", [digits, dashed]]},
+			{"estab": digits[:3], "ptoemi": digits[3:6], "secuencial": int(digits[6:])},
+			{"remarks": ["like", f"%SRI {dashed}%"]},
+		):
+			found = frappe.get_all("Sales Invoice", filters={**base, **filters}, fields=["name", "customer", "debit_to"], limit=2)
+			if len(found) == 1:
+				return found[0]
+			if len(found) > 1:
+				frappe.throw(frappe._("More than one Sales Invoice matches {0}").format(dashed))
+		frappe.throw(frappe._("Sales Invoice not found for numDocSustento {0}").format(num_doc))
+
+	def append_sales_withholding_lines(self, journal_entry):
+		# One credit line per Sales Invoice (debit_to, Customer, reference), debits on the RET accounts.
+		credits = {}
+		for itemTax in self.taxes:
+			si = self.find_sales_invoice(itemTax.numDocSustento)
+			credits.setdefault(si.name, {"si": si, "amount": 0})["amount"] += itemTax.valorRetenido
+		journal_entry.pay_to_recd_from = next(iter(credits.values()))["si"].customer
+		for itemTax in self.taxes:
+			journal_entry.append('accounts', {
+				'account': itemTax.codigoRetencion,
+				'debit': itemTax.valorRetenido,
+				'debit_in_account_currency': itemTax.valorRetenido,
+				'credit': 0,
+				'credit_in_account_currency': 0,
+			})
+		for row in credits.values():
+			journal_entry.append('accounts', {
+				'account': row["si"].debit_to,
+				'debit': 0,
+				'debit_in_account_currency': 0,
+				'credit': row["amount"],
+				'credit_in_account_currency': row["amount"],
+				'party_type': 'Customer',
+				'party': row["si"].customer,
+				'reference_type': 'Sales Invoice',
+				'reference_name': row["si"].name,
+			})
+
 	def create_journal_entry(self):
         # Define the necessary data for the journal entry
 		journal_entry = frappe.new_doc('Journal Entry')
 		journal_entry.voucher_type = 'Journal Entry'
 		journal_entry.company = self.company
 		journal_entry.pay_to_recd_from = self.purchase_withholding_supplier
-		journal_entry.posting_date = frappe.utils.nowdate()
+		journal_entry.posting_date = self.get_posting_date()
 		journal_entry.user_remark = f'Journal Entry for Purchase Withholding {self.name}'
 		journal_entry.remark = f'Journal Entry for Purchase Withholding {self.name}'
 		journal_entry.title = f'AUTO-{self.name}'
@@ -55,6 +114,12 @@ class PurchaseWithholdingSriEc(Document):
 		#journal_entry.bill_no = "Accounts Receivable"
 		#journal_entry.bill_date = "Accounts Receivable"
 		#journal_entry.due_date = "Accounts Receivable"
+
+		if self.is_sales_withholding():
+			self.append_sales_withholding_lines(journal_entry)
+			journal_entry.save(ignore_permissions=True)
+			journal_entry.submit()
+			return
 
 		account_for_withHolding = frappe.get_cached_value(
 			"Company", self.company, "default_payable_account"
